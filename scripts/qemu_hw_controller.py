@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""Host-side hardware capability controller & bridge for OpenHarmony QEMU.
+
+Provides:
+1. Daemon mode (--daemon):
+   - Listens on --socket / --virtserial-socket (/tmp/openharmony-qemu-hw-<HDC_PORT>.sock)
+     for QEMU's virtserialport `ohos.hw.bridge0`.
+   - Listens on --ctrl-socket / --control-socket (/tmp/openharmony-qemu-hw-<HDC_PORT>.ctrl.sock)
+     for live host CLI commands.
+   - Syncs host UTC epoch ms (`TIME <ms>`) and initial state to the guest upon connection/HELLO.
+   - Optionally syncs host <-> guest clipboard when --clipboard-sync or --clipboard=on.
+
+2. CLI client mode:
+   - `python3 tools/qemu_hw_controller.py [--socket /tmp/openharmony-qemu-hw-5555.ctrl.sock | --port 5555] status`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] gps 39.9042 116.4074 50`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] accel 0.0 9.8 0.0`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] rotation 0.0 0.0 0.0 1.0`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] headposture 1.0 0.0 0.0 0.0`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] battery 85 Charging`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] thermal 32.5`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] camera smpte`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] clipboard-set "Hello OHOS"`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] clipboard-get`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] key power`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] network offline`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] gyro 0.1 0.2 0.3`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] light 450`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] proximity 2.0`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] barometer 1015.5`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] magnetic 25.0 1.0 -42.0`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] usb-serial-send "PING_FTDI"`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] usb-serial-read`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] locale en`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] locale zh-Hans`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] locale status`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] locale list`
+   - `python3 tools/qemu_hw_controller.py [--port 5555] region US`
+"""
+
+import argparse
+import base64
+import logging
+import os
+import select
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+from typing import Optional, Sequence
+
+
+def env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        val = os.environ.get(name, "")
+        if val != "":
+            return val
+    return default
+
+
+def env_bool(*names: str, default: bool = False) -> bool:
+    raw = env_first(*names, default="").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"invalid boolean value {raw!r} in {'/'.join(names)}")
+
+
+def env_port_default() -> int:
+    raw = env_first("QEMU_HDC_PORT", "QEMU_HDC_HOST_PORT", "OHOS_QEMU_HDC_PORT", default="")
+    if not raw:
+        connect = env_first("QEMU_CONNECT", "OHOS_QEMU_CONNECT", default="")
+        if ":" in connect:
+            raw = connect.rsplit(":", 1)[-1]
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return 5555
+
+
+def get_host_clipboard() -> Optional[str]:
+    try:
+        if sys.platform == "darwin":
+            res = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0:
+                return res.stdout
+    except Exception:
+        pass
+    return None
+
+
+def run_daemon(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        filename=args.log,
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    for sock_path in (args.virtserial_socket, args.control_socket, args.usb_serial_socket):
+        if sock_path and os.path.exists(sock_path):
+            try:
+                os.unlink(sock_path)
+            except OSError:
+                pass
+
+    vport_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    vport_srv.bind(args.virtserial_socket)
+    vport_srv.listen(2)
+    vport_srv.setblocking(False)
+
+    ctrl_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    ctrl_srv.bind(args.control_socket)
+    ctrl_srv.listen(8)
+    ctrl_srv.setblocking(False)
+
+    usb_serial_srv: Optional[socket.socket] = None
+    if args.usb_serial_socket:
+        usb_serial_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        usb_serial_srv.bind(args.usb_serial_socket)
+        usb_serial_srv.listen(2)
+        usb_serial_srv.setblocking(False)
+
+    if args.pidfile:
+        with open(args.pidfile, "w", encoding="utf-8") as f:
+            f.write(f"{os.getpid()}\n")
+
+    running = True
+
+    def handle_sig(_signum, _frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, handle_sig)
+    signal.signal(signal.SIGINT, handle_sig)
+
+    guest_conn: Optional[socket.socket] = None
+    guest_rx_buf = b""
+    usb_serial_conn: Optional[socket.socket] = None
+    usb_serial_rx_buf = b""
+    usb_serial_loopback = args.usb_serial_mode.lower() in ("loopback", "auto", "on", "")
+    last_usb_tx_payload = b""
+    last_usb_tx_time = 0.0
+    pending_ctrl_client: Optional[socket.socket] = None
+    pending_ctrl_deadline: float = 0.0
+    internal_pending_replies: int = 0
+    last_clip_check: float = 0.0
+    clip_sync = args.clipboard_sync or args.clipboard == "on"
+    initial_clip_text: Optional[str] = None
+    if args.clipboard not in ("auto", "on", "off", ""):
+        initial_clip_text = args.clipboard
+    last_host_clip: Optional[str] = get_host_clipboard() if clip_sync else None
+
+    logging.info(
+        "QEMU HW controller started: virtserial=%s control=%s usb_serial=%s clip_sync=%s",
+        args.virtserial_socket,
+        args.control_socket,
+        args.usb_serial_socket or "none",
+        clip_sync,
+    )
+
+    def send_to_guest(line: str, is_internal: bool = False) -> bool:
+        nonlocal guest_conn, internal_pending_replies
+        if guest_conn is None:
+            return False
+        if not line.endswith("\n"):
+            line += "\n"
+        try:
+            guest_conn.sendall(line.encode("utf-8", errors="replace"))
+            if is_internal:
+                internal_pending_replies += 1
+            return True
+        except OSError:
+            try:
+                guest_conn.close()
+            except OSError:
+                pass
+            guest_conn = None
+            return False
+
+    def push_initial_state() -> None:
+        epoch_ms = int(time.time() * 1000)
+        send_to_guest(f"TIME {epoch_ms}", is_internal=True)
+        if args.gps:
+            send_to_guest(f"GPS {args.gps}", is_internal=True)
+        if args.sensor:
+            parts = args.sensor.split(":", 1)
+            if parts[0]:
+                send_to_guest(f"ACCEL {parts[0]}", is_internal=True)
+            if len(parts) > 1 and parts[1]:
+                send_to_guest(f"ROTATION {parts[1]}", is_internal=True)
+        if args.battery:
+            send_to_guest(f"BATTERY {args.battery}", is_internal=True)
+        if args.thermal:
+            send_to_guest(f"THERMAL {args.thermal}", is_internal=True)
+        if args.camera:
+            send_to_guest(f"CAMERA {args.camera}", is_internal=True)
+        if args.locale or args.region:
+            if args.locale and args.region:
+                send_to_guest(f"LOCALE {args.locale}:{args.region}", is_internal=True)
+            elif args.locale:
+                send_to_guest(f"LOCALE {args.locale}", is_internal=True)
+            else:
+                send_to_guest(f"REGION {args.region}", is_internal=True)
+        if initial_clip_text is not None:
+            b64 = base64.b64encode(initial_clip_text.encode("utf-8")).decode("ascii")
+            send_to_guest(f"CLIPBOARD_SET_B64 {b64}", is_internal=True)
+
+    try:
+        while running:
+            rlist = [vport_srv, ctrl_srv]
+            if usb_serial_srv is not None:
+                rlist.append(usb_serial_srv)
+            if guest_conn is not None:
+                rlist.append(guest_conn)
+            if usb_serial_conn is not None:
+                rlist.append(usb_serial_conn)
+            readable, _, _ = select.select(rlist, [], [], 0.25)
+
+            for s in readable:
+                if s is vport_srv:
+                    conn, _ = vport_srv.accept()
+                    if guest_conn is not None:
+                        try:
+                            guest_conn.close()
+                        except OSError:
+                            pass
+                    guest_conn = conn
+                    guest_conn.setblocking(False)
+                    guest_rx_buf = b""
+                    internal_pending_replies = 0
+                    logging.info("QEMU virtserial socket connected")
+
+                elif usb_serial_srv is not None and s is usb_serial_srv:
+                    conn, _ = usb_serial_srv.accept()
+                    if usb_serial_conn is not None:
+                        try:
+                            usb_serial_conn.close()
+                        except OSError:
+                            pass
+                    usb_serial_conn = conn
+                    usb_serial_conn.setblocking(False)
+                    logging.info("QEMU usb-serial socket connected (loopback=%s)", usb_serial_loopback)
+
+                elif usb_serial_conn is not None and s is usb_serial_conn:
+                    try:
+                        chunk = usb_serial_conn.recv(4096)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        try:
+                            usb_serial_conn.close()
+                        except OSError:
+                            pass
+                        usb_serial_conn = None
+                        continue
+                    now_ts = time.time()
+                    if last_usb_tx_payload and chunk == last_usb_tx_payload and (now_ts - last_usb_tx_time) < 0.5:
+                        # Suppress tty line-discipline echo bounce from guest
+                        continue
+                    usb_serial_rx_buf = (usb_serial_rx_buf + chunk)[-65536:]
+                    if usb_serial_loopback:
+                        try:
+                            last_usb_tx_payload = chunk
+                            last_usb_tx_time = now_ts
+                            usb_serial_conn.sendall(chunk)
+                        except OSError:
+                            pass
+
+                elif s is ctrl_srv:
+                    c_conn, _ = ctrl_srv.accept()
+                    c_conn.settimeout(1.0)
+                    try:
+                        raw = c_conn.recv(4096)
+                    except OSError:
+                        c_conn.close()
+                        continue
+                    cmd = raw.decode("utf-8", errors="replace").strip()
+                    if not cmd:
+                        c_conn.close()
+                        continue
+                    if cmd.upper().startswith("USB_SERIAL_SEND_B64 "):
+                        b64_str = cmd.split(" ", 1)[1].strip()
+                        if usb_serial_conn is None:
+                            try:
+                                c_conn.sendall(b"ERR usb-serial socket not connected\n")
+                            except OSError:
+                                pass
+                            c_conn.close()
+                            continue
+                        try:
+                            payload = base64.b64decode(b64_str)
+                            last_usb_tx_payload = payload
+                            last_usb_tx_time = time.time()
+                            usb_serial_conn.sendall(payload)
+                            c_conn.sendall(f"OK USB_SERIAL_SEND {len(payload)}\n".encode("utf-8"))
+                        except Exception as exc:
+                            try:
+                                c_conn.sendall(f"ERR usb-serial send: {exc}\n".encode("utf-8"))
+                            except OSError:
+                                pass
+                        c_conn.close()
+                        continue
+                    if cmd.upper() == "USB_SERIAL_READ":
+                        b64_out = base64.b64encode(usb_serial_rx_buf).decode("ascii")
+                        usb_serial_rx_buf = b""
+                        try:
+                            c_conn.sendall(f"USB_SERIAL_B64 {b64_out}\n".encode("utf-8"))
+                        except OSError:
+                            pass
+                        c_conn.close()
+                        continue
+                    if guest_conn is None:
+                        try:
+                            c_conn.sendall(b"ERR guest bridge not connected\n")
+                        except OSError:
+                            pass
+                        c_conn.close()
+                        continue
+                    if pending_ctrl_client is not None:
+                        try:
+                            pending_ctrl_client.close()
+                        except OSError:
+                            pass
+                    pending_ctrl_client = c_conn
+                    pending_ctrl_deadline = time.time() + 8.5
+                    send_to_guest(cmd, is_internal=False)
+
+                elif s is guest_conn:
+                    try:
+                        chunk = guest_conn.recv(4096)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        try:
+                            guest_conn.close()
+                        except OSError:
+                            pass
+                        guest_conn = None
+                        continue
+                    guest_rx_buf += chunk
+                    while b"\n" in guest_rx_buf:
+                        line_bytes, guest_rx_buf = guest_rx_buf.split(b"\n", 1)
+                        line = line_bytes.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        logging.info("Guest line: %s", line)
+                        if line.startswith("HELLO"):
+                            push_initial_state()
+                            continue
+                        if internal_pending_replies > 0 and pending_ctrl_client is None:
+                            internal_pending_replies -= 1
+                            continue
+                        if internal_pending_replies > 0 and line.startswith("OK TIME"):
+                            internal_pending_replies -= 1
+                            continue
+                        if pending_ctrl_client is not None:
+                            try:
+                                pending_ctrl_client.sendall((line + "\n").encode("utf-8"))
+                            except OSError:
+                                pass
+                            try:
+                                pending_ctrl_client.close()
+                            except OSError:
+                                pass
+                            pending_ctrl_client = None
+
+            now = time.time()
+            if pending_ctrl_client is not None and now > pending_ctrl_deadline:
+                try:
+                    pending_ctrl_client.sendall(b"ERR timeout waiting for guest bridge\n")
+                    pending_ctrl_client.close()
+                except OSError:
+                    pass
+                pending_ctrl_client = None
+
+            # Optional host->guest clipboard sync
+            if clip_sync and guest_conn is not None and pending_ctrl_client is None and now - last_clip_check >= 2.0:
+                last_clip_check = now
+                cur_clip = get_host_clipboard()
+                if cur_clip is not None and cur_clip != last_host_clip and len(cur_clip) <= 2048:
+                    last_host_clip = cur_clip
+                    b64 = base64.b64encode(cur_clip.encode("utf-8")).decode("ascii")
+                    send_to_guest(f"CLIPBOARD_SET_B64 {b64}", is_internal=True)
+
+    finally:
+        if guest_conn is not None:
+            try:
+                guest_conn.close()
+            except OSError:
+                pass
+        if usb_serial_conn is not None:
+            try:
+                usb_serial_conn.close()
+            except OSError:
+                pass
+        vport_srv.close()
+        ctrl_srv.close()
+        if usb_serial_srv is not None:
+            usb_serial_srv.close()
+        for p in (args.virtserial_socket, args.control_socket, args.usb_serial_socket, args.pidfile):
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+    return 0
+
+
+def run_client(args: argparse.Namespace) -> int:
+    ctrl_sock = args.control_socket or args.virtserial_socket
+    if not ctrl_sock:
+        cand1 = f"/tmp/openharmony-qemu-hw-{args.port}.ctrl.sock"
+        cand2 = f"/tmp/openharmony-qemu-hwctl-{args.port}.sock"
+        ctrl_sock = cand1 if os.path.exists(cand1) else cand2
+    if not os.path.exists(ctrl_sock):
+        print(f"Control socket not found: {ctrl_sock}", file=sys.stderr)
+        return 2
+
+    sub = args.command[0].lower()
+    rest = " ".join(args.command[1:]).strip()
+    csv_rest = ",".join(p.strip(",") for p in rest.replace(",", " ").split())
+    colon_rest = ":".join(p.strip(":") for p in rest.replace(":", " ").split())
+    if sub in ("status", "ping"):
+        wire = "STATUS"
+    elif sub == "gps":
+        wire = f"GPS {csv_rest}"
+    elif sub in ("sensor", "accel"):
+        wire = f"ACCEL {csv_rest}"
+    elif sub == "rotation":
+        wire = f"ROTATION {csv_rest}"
+    elif sub == "headposture":
+        wire = f"HEADPOSTURE {csv_rest}"
+    elif sub == "gyro":
+        wire = f"GYRO {csv_rest}"
+    elif sub == "light":
+        wire = f"LIGHT {rest}"
+    elif sub == "proximity":
+        wire = f"PROXIMITY {rest}"
+    elif sub == "barometer":
+        wire = f"BAROMETER {rest}"
+    elif sub == "magnetic":
+        wire = f"MAGNETIC {csv_rest}"
+    elif sub == "key":
+        wire = f"KEY {rest}"
+    elif sub in ("network", "net"):
+        wire = f"NETWORK {colon_rest}"
+    elif sub == "battery":
+        wire = f"BATTERY {colon_rest}"
+    elif sub == "thermal":
+        wire = f"THERMAL {rest}"
+    elif sub == "camera":
+        wire = f"CAMERA {rest}"
+    elif sub == "clipboard-set":
+        b64 = base64.b64encode(rest.encode("utf-8")).decode("ascii")
+        wire = f"CLIPBOARD_SET_B64 {b64}"
+    elif sub == "clipboard-get":
+        wire = "CLIPBOARD_GET"
+    elif sub == "usb-serial-send":
+        b64 = base64.b64encode((rest + "\n").encode("utf-8")).decode("ascii")
+        wire = f"USB_SERIAL_SEND_B64 {b64}"
+    elif sub == "usb-serial-read":
+        wire = "USB_SERIAL_READ"
+    elif sub in ("locale", "lang", "language"):
+        if not rest or rest.lower() in ("status", "get"):
+            wire = "LOCALE"
+        elif rest.lower() in ("list", "--list"):
+            wire = "LOCALE_LIST"
+        elif args.region and ":" not in rest:
+            wire = f"LOCALE {rest}:{args.region}"
+        else:
+            wire = f"LOCALE {rest}"
+    elif sub == "region":
+        wire = f"REGION {rest}" if rest else "LOCALE"
+    elif sub == "time":
+        ms = int(rest) if rest else int(time.time() * 1000)
+        wire = f"TIME {ms}"
+    else:
+        wire = " ".join(args.command)
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10.0)
+    s.connect(ctrl_sock)
+    s.sendall((wire + "\n").encode("utf-8"))
+    resp = s.recv(8192).decode("utf-8", errors="replace").strip()
+    s.close()
+
+    if sub == "clipboard-get" and resp.startswith("CLIPBOARD_B64"):
+        parts = resp.split(" ", 1)
+        b64_payload = parts[1] if len(parts) > 1 else ""
+        try:
+            decoded = base64.b64decode(b64_payload).decode("utf-8", errors="replace")
+            print(decoded)
+            return 0
+        except Exception as exc:
+            print(f"ERR decode clipboard: {exc}", file=sys.stderr)
+            return 1
+
+    if sub == "usb-serial-read" and resp.startswith("USB_SERIAL_B64"):
+        parts = resp.split(" ", 1)
+        b64_payload = parts[1] if len(parts) > 1 else ""
+        try:
+            decoded = base64.b64decode(b64_payload).decode("utf-8", errors="replace")
+            print(decoded, end="" if decoded.endswith("\n") else "\n")
+            return 0
+        except Exception as exc:
+            print(f"ERR decode usb-serial: {exc}", file=sys.stderr)
+            return 1
+
+    print(resp)
+    return 1 if resp.startswith("ERR") else 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "OpenHarmony QEMU Hardware & Locale Capability Controller. "
+            "CLI options override matching QEMU_* / OHOS_QEMU_* environment variables."
+        )
+    )
+    parser.add_argument(
+        "--daemon",
+        action="store_true",
+        default=env_bool("QEMU_HW_DAEMON", default=False),
+        help="Run as host virtserial bridge daemon (env: QEMU_HW_DAEMON)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=env_port_default(),
+        help="HDC host port (env: QEMU_HDC_PORT / QEMU_HDC_HOST_PORT, default: 5555)",
+    )
+    parser.add_argument(
+        "--socket",
+        "--virtserial-socket",
+        dest="virtserial_socket",
+        default=env_first("QEMU_HW_VIRTSERIAL_SOCKET", "QEMU_HW_SOCKET", default=""),
+        help="VirtIO serial UNIX socket path, or control socket in client mode (env: QEMU_HW_VIRTSERIAL_SOCKET / QEMU_HW_SOCKET)",
+    )
+    parser.add_argument(
+        "--ctrl-socket",
+        "--control-socket",
+        dest="control_socket",
+        default=env_first("QEMU_HW_CTRL_SOCKET", "QEMU_HW_CONTROL_SOCKET", default=""),
+        help="Host control UNIX socket path (env: QEMU_HW_CTRL_SOCKET / QEMU_HW_CONTROL_SOCKET)",
+    )
+    parser.add_argument(
+        "--usb-serial-socket",
+        dest="usb_serial_socket",
+        default=env_first("QEMU_USB_SERIAL_SOCKET", default=""),
+        help="USB serial UNIX socket path (env: QEMU_USB_SERIAL_SOCKET)",
+    )
+    parser.add_argument(
+        "--usb-serial-mode",
+        dest="usb_serial_mode",
+        default=env_first("QEMU_USB_SERIAL_MODE", "QEMU_USB_SERIAL", default="loopback"),
+        help="USB serial host mode: loopback|on (env: QEMU_USB_SERIAL_MODE / QEMU_USB_SERIAL)",
+    )
+    parser.add_argument(
+        "--pidfile",
+        default=env_first("QEMU_HW_PIDFILE", default=""),
+        help="PID file path (env: QEMU_HW_PIDFILE)",
+    )
+    parser.add_argument(
+        "--log",
+        default=env_first("QEMU_HW_LOG", default="/tmp/openharmony-qemu-hw.log"),
+        help="Log file path (env: QEMU_HW_LOG)",
+    )
+    parser.add_argument(
+        "--gps",
+        default=env_first("QEMU_GPS", "OHOS_QEMU_GPS", default=""),
+        help="Initial GPS coordinates (env: QEMU_GPS)",
+    )
+    parser.add_argument(
+        "--sensor",
+        default=env_first("QEMU_SENSOR", "OHOS_QEMU_SENSOR", default=""),
+        help="Initial sensor coordinates (env: QEMU_SENSOR)",
+    )
+    parser.add_argument(
+        "--battery",
+        default=env_first("QEMU_BATTERY", "OHOS_QEMU_BATTERY", default=""),
+        help="Initial battery state (env: QEMU_BATTERY)",
+    )
+    parser.add_argument(
+        "--thermal",
+        default=env_first("QEMU_THERMAL", "OHOS_QEMU_THERMAL", default=""),
+        help="Initial thermal temperature (env: QEMU_THERMAL)",
+    )
+    parser.add_argument(
+        "--camera",
+        default=env_first("QEMU_CAMERA_FEED", "QEMU_CAMERA", "OHOS_QEMU_CAMERA_FEED", default=""),
+        help="Initial camera pattern (env: QEMU_CAMERA_FEED / QEMU_CAMERA)",
+    )
+    parser.add_argument(
+        "--locale",
+        "--lang",
+        dest="locale",
+        default=env_first("QEMU_LOCALE", "QEMU_LANG", "OHOS_QEMU_LOCALE", "OHOS_QEMU_LANG", default=""),
+        help="Initial or target system language/locale tag, e.g. en, en-Latn-US, zh-Hans, ja (env: QEMU_LOCALE / QEMU_LANG)",
+    )
+    parser.add_argument(
+        "--region",
+        default=env_first("QEMU_REGION", "OHOS_QEMU_REGION", default=""),
+        help="Initial or target ISO 3166-1 region tag, e.g. US, GB, CN, JP (env: QEMU_REGION)",
+    )
+    parser.add_argument(
+        "--clipboard",
+        default=env_first("QEMU_CLIPBOARD", "OHOS_QEMU_CLIPBOARD", default="auto"),
+        help="Clipboard mode or initial text (env: QEMU_CLIPBOARD)",
+    )
+    parser.add_argument(
+        "--clipboard-sync",
+        action="store_true",
+        default=env_bool("QEMU_CLIPBOARD_SYNC", default=False),
+        help="Enable host-to-guest clipboard auto-sync (env: QEMU_CLIPBOARD_SYNC)",
+    )
+    parser.add_argument("command", nargs="*", help="Command when running in CLI client mode (env: QEMU_HW_COMMAND)")
+    args = parser.parse_args(argv)
+
+    if args.daemon:
+        if not args.virtserial_socket:
+            args.virtserial_socket = f"/tmp/openharmony-qemu-hw-{args.port}.sock"
+        if not args.control_socket:
+            args.control_socket = f"/tmp/openharmony-qemu-hw-{args.port}.ctrl.sock"
+        return run_daemon(args)
+
+    if not args.command:
+        env_cmd = env_first("QEMU_HW_COMMAND", default="").strip()
+        if env_cmd:
+            args.command = shlex.split(env_cmd)
+
+    if not args.command:
+        parser.print_help(sys.stderr)
+        return 2
+    return run_client(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

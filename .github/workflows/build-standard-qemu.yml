@@ -1,0 +1,90 @@
+name: Verify and Build OpenHarmony QEMU Images
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      device_type:
+        description: "QEMU device profile"
+        required: true
+        default: "2in1"
+        type: choice
+        options:
+          - 2in1
+          - phone
+      product:
+        description: "Target QEMU product"
+        required: true
+        default: "arm64_virt"
+        type: choice
+        options:
+          - arm64_virt
+          - x86_64_virt
+          - armv7a_virt
+      skip_build:
+        description: "Only run static checks and component input materialization"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: ohos-qemu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify Packaging Scripts and Component Recipes
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout ohos-qemu
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Materialize component-owned patches from openharmony-qemu/manifest
+        run: bash scripts/ensure_component_inputs.sh
+
+      - name: Verify recipe hashes, syntax, and unit tests
+        run: |
+          set -euo pipefail
+          mesa_hash="$(python3 scripts/qemu_mesa_llvm_artifacts.py --recipe-hash)"
+          echo "Mesa LLVM recipe hash: ${mesa_hash}"
+          test "${mesa_hash}" = "634e042f0532266d934ad4c6ee9cc52a85695f49f8079e7303ec57f1a0981cdd"
+          m144_json="$(python3 scripts/m144_dependency_recipe.py)"
+          echo "M144 dependency recipe: ${m144_json}"
+          for f in scripts/*.sh; do
+            bash -n "$f"
+          done
+          python3 -m py_compile scripts/*.py
+          python3 -m unittest discover -s tests -v
+
+  build:
+    name: Build Standard QEMU Image (${{ inputs.device_type }} / ${{ inputs.product }})
+    if: github.event_name == 'workflow_dispatch' && !inputs.skip_build
+    needs: verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout ohos-qemu
+        uses: actions/checkout@v4
+
+      - name: Materialize component-owned patches
+        run: bash scripts/ensure_component_inputs.sh
+
+      - name: Prepare M144 dependencies and build Docker image target
+        env:
+          DEVICE_TYPE: ${{ inputs.device_type }}
+          PRODUCTS: ${{ inputs.product }}
+          CACHE_ROOT: ${{ github.workspace }}/.cache/ohos-qemu
+        run: |
+          set -euo pipefail
+          mkdir -p "${CACHE_ROOT}"
+          bash scripts/prepare_qemu_release_dependencies.sh "${PRODUCTS}"
+          bash scripts/run_2in1_full_build_docker.sh
